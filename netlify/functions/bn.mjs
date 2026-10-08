@@ -1,33 +1,26 @@
 /**
  * Netlify Function —— 币安永续数据转发（双跳）
  *
- *   本机 → Netlify(美国) → Vercel(东京) → 币安
+ *   本机 → Netlify(美国俄亥俄) → Vercel(东京 hnd1) → 币安
  *
  * 用法：
  *   /api/bn?path=/fapi/v1/klines&symbol=ETHUSDT&interval=1m&limit=1500
  *   /api/bn?path=/fapi/v1/ticker/24hr&symbol=BTCUSDT
  *   /api/bn?path=/dapi/v1/time
- *   /api/bn?path=/api/v3/klines&symbol=BTCUSDT&interval=1m&limit=100
  */
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// Vercel 东京节点的候选域名（第一个已验证可用）
+// Vercel 东京节点（第一个已验证）
 const HOPS = [
   "https://bn-relay-vercel.vercel.app",
   "https://bn-relay-vercel-itsheygfi-fm-2027.vercel.app",
 ];
 
-// 允许的币安路径前缀
-const ALLOW = [
-  "/fapi/",     // USDT 本位合约
-  "/dapi/",     // 币本位合约
-  "/api/",      // 现货（经 spot 段）
-  "/spot/",
-];
+const ALLOW = ["/fapi/", "/dapi/", "/spot/", "/api/"];
 
-async function fetchTimeout(url, ms = 45000) {
+async function fetchTimeout(url, ms = 55000) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), ms);
   try {
@@ -37,6 +30,7 @@ async function fetchTimeout(url, ms = 45000) {
       headers: {
         "User-Agent": UA,
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
       },
       redirect: "follow",
     });
@@ -50,74 +44,64 @@ async function fetchTimeout(url, ms = 45000) {
   }
 }
 
+const JSON_H = {
+  "Content-Type": "application/json; charset=utf-8",
+  "Access-Control-Allow-Origin": "*",
+  "Cache-Control": "no-store",
+};
+
 export default async (req) => {
   const url = new URL(req.url);
+  const bnPath = url.searchParams.get("path") || "";
 
-  // 健康检查
-  if (url.pathname === "/api/bn" && !url.searchParams.get("path")) {
-    return new Response(JSON.stringify({
+  // 健康检查 / 用法说明
+  if (!bnPath) {
+    const out = {
       ok: true,
+      chain: "you -> netlify(us-east-2) -> vercel(tokyo hnd1) -> binance",
       usage: "/api/bn?path=/fapi/v1/klines&symbol=ETHUSDT&interval=1m&limit=1500",
-      chain: "you -> netlify(us) -> vercel(tokyo) -> binance",
       hops: HOPS,
       allowed: ALLOW,
-    }, null, 2), {
-      headers: { "Content-Type": "application/json; charset=utf-8",
-                 "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" },
-    });
+    };
+    // 顺便验证跳板是否活着
+    const h = await fetchTimeout(HOPS[0] + "/api/relay", 20000);
+    out.hop_ok = h.status === 200;
+    out.hop_ms = h.ms;
+    return new Response(JSON.stringify(out, null, 2), { headers: JSON_H });
   }
 
-  const bnPath = url.searchParams.get("path") || "";
   if (!ALLOW.some(p => bnPath.startsWith(p))) {
     return new Response(JSON.stringify({
       error: "path not allowed", path: bnPath, allowed: ALLOW,
-    }), { status: 403, headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Access-Control-Allow-Origin": "*" } });
+    }), { status: 403, headers: JSON_H });
   }
 
-  // 组装币安的查询串（去掉 path 参数）
-  const qs = new URLSearchParams(url.searchParams);
-  qs.delete("path");
-  qs.delete("hop");
-  const query = qs.toString();
+  // 其余查询参数原样传给 Vercel
+  const params = new URLSearchParams(url.searchParams);
+  params.delete("path");
+  params.delete("hop");
+  params.set("path", bnPath);
 
-  // 选定跳板
   const hopIdx = parseInt(url.searchParams.get("hop") || "0", 10);
   const hopBase = HOPS[Math.min(hopIdx, HOPS.length - 1)] || HOPS[0];
+  const target = hopBase + "/api/relay?" + params.toString();
 
-  // Vercel 的透传路径：/fapi/* → fapi.binance.com/fapi/*
-  //   /api/*   → api.binance.com/api/*
-  //   /dapi/*  → dapi.binance.com/dapi/*
-  let vPath = bnPath;
-  if (bnPath.startsWith("/spot/")) vPath = "/spot/" + bnPath.slice(6);
-
-  const target = hopBase + vPath + (query ? "?" + query : "");
-
-  const r = await fetchTimeout(target, 45000);
-
-  const meta = {
-    chain: "netlify -> vercel(tokyo) -> binance",
-    hop: hopBase,
-    target,
-    upstream_ms: r.ms,
-    upstream_status: r.status,
-  };
+  const r = await fetchTimeout(target, 55000);
 
   if (r.error) {
-    return new Response(JSON.stringify({ ...meta, error: r.error }, null, 2),
-      { status: 502, headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" } });
+    return new Response(JSON.stringify({
+      chain: "netlify -> vercel(tokyo) -> binance",
+      hop: hopBase, target, error: r.error,
+    }, null, 2), { status: 502, headers: JSON_H });
   }
 
   return new Response(r.body, {
     status: r.status,
     headers: {
       "Content-Type": r.ctype || "application/json",
-      "X-Chain": meta.chain,
+      "X-Chain": "netlify -> vercel(tokyo) -> binance",
       "X-Hop": hopBase,
-      "X-Upstream-Ms": String(r.ms || ""),
+      "X-Hop-Ms": String(r.ms || ""),
       "Access-Control-Allow-Origin": "*",
       "Cache-Control": "no-store",
     },
